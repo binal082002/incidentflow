@@ -8,12 +8,16 @@ import { trackAndDetectSpike } from "../utils/spike";
 const EVENT_QUEUE = "incidentflow:events";
 const INCIDENT_UPDATE_CHANNEL = "incidentflow:incident-updates";
 
-const redisWorker = createClient({
-  socket: {
-    host: config.redis.host,
-    port: config.redis.port,
-  },
-});
+const redisWorker = config.redis.url
+  ? createClient({
+      url: config.redis.url,
+    })
+  : createClient({
+      socket: {
+        host: config.redis.host,
+        port: config.redis.port,
+      },
+    });
 
 redisWorker.on("error", (error) => {
   console.error("Redis worker error:", error);
