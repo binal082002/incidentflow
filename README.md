@@ -2,9 +2,10 @@
 
 IncidentFlow is an event-driven incident monitoring platform inspired by tools like Sentry and PagerDuty. External applications send runtime errors to IncidentFlow, which groups similar errors into incidents, detects spikes, calculates severity, stores incident history, and pushes realtime updates to a React dashboard.
 
-The project demonstrates full-stack development, asynchronous processing, Redis queues/PubSub, PostgreSQL data modelling, JWT authentication, project-level authorization, secure API-key ingestion, and Socket.IO realtime updates.
+The project demonstrates full-stack development, asynchronous processing, Redis queues/PubSub, PostgreSQL data modelling, JWT authentication, project-level authorization, secure API-key ingestion, and Socket.IO realtime updates. 
 
-**Live Demo - https://incident-flow.netlify.app**
+Live Demo - https://incident-flow.netlify.app 
+
 ---
 
 ## Architecture
