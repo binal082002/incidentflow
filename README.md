@@ -4,6 +4,7 @@ IncidentFlow is an event-driven incident monitoring platform inspired by tools l
 
 The project demonstrates full-stack development, asynchronous processing, Redis queues/PubSub, PostgreSQL data modelling, JWT authentication, project-level authorization, secure API-key ingestion, and Socket.IO realtime updates.
 
+**Live Demo - https://incident-flow.netlify.app**
 ---
 
 ## Architecture
