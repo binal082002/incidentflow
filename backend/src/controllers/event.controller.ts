@@ -3,6 +3,12 @@ import { db } from "../db";
 import { IncidentEvent } from "../types";
 import { enqueueEvent } from "../queues/event.queue";
 import { hashApiKey } from "../utils/apiKey";
+import { checkIngestRateLimit } from "../utils/ingestRateLimit";
+import { generateFingerprint } from "../utils/fingerprint";
+import {
+  checkFingerprintRateLimit,
+  recordSuppressedDuplicate,
+} from "../utils/fingerprintRateLimit";
 
 export const ingestEvent = async (
   req: Request,
@@ -20,6 +26,19 @@ export const ingestEvent = async (
     }
 
     const apiKeyHash = hashApiKey(apiKey);
+
+    const rateLimit = await checkIngestRateLimit(apiKeyHash);
+
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", "1");
+
+      res.status(429).json({
+        message: "Ingest rate limit exceeded",
+        retryAfter: 1,
+      });
+
+      return;
+    }
 
     const projectResult = await db.query(
       `
@@ -51,6 +70,27 @@ export const ingestEvent = async (
       return;
     }
 
+    const fingerprint = generateFingerprint(service, endpoint, message);
+
+    const fingerprintAllowed = await checkFingerprintRateLimit(
+      projectId,
+      fingerprint
+    );
+
+    if (!fingerprintAllowed) {
+      const suppressedCount = await recordSuppressedDuplicate(
+        projectId,
+        fingerprint
+      );
+
+      res.status(202).json({
+        message: "Duplicate event suppressed",
+        suppressedCount,
+      });
+
+      return;
+    }
+
     const serviceResult = await db.query(
       `
       SELECT id
@@ -71,7 +111,7 @@ export const ingestEvent = async (
 
     const serviceId = serviceResult.rows[0].id;
 
-    await enqueueEvent({
+    const queued = await enqueueEvent({
       service,
       serviceId,
       projectId,
@@ -81,6 +121,17 @@ export const ingestEvent = async (
       endpoint,
       timestamp,
     });
+
+    if (!queued) {
+      res.setHeader("Retry-After", "2");
+
+      res.status(503).json({
+        message: "Event queue is temporarily full",
+        retryAfter: 2,
+      });
+
+      return;
+    }
 
     res.status(202).json({
       message: "Event accepted for processing",

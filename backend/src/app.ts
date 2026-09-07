@@ -13,8 +13,11 @@ app.use(
   })
 );
 
-app.use(express.json());
-
+app.use(
+  express.json({
+    limit: "32kb",
+  })
+);
 app.use("/api/v1", routes);
 
 app.use(notFoundHandler);

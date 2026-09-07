@@ -4,6 +4,10 @@ import { db } from "../db";
 import { generateFingerprint } from "../utils/fingerprint";
 import { calculateSeverity, getHigherSeverity } from "../utils/severity";
 import { trackAndDetectSpike } from "../utils/spike";
+import {
+  consumeSuppressedDuplicates,
+  getDueSuppressedFlushes,
+} from "../utils/fingerprintRateLimit";
 
 const EVENT_QUEUE = "incidentflow:events";
 const INCIDENT_UPDATE_CHANNEL = "incidentflow:incident-updates";
@@ -23,15 +27,138 @@ redisWorker.on("error", (error) => {
   console.error("Redis worker error:", error);
 });
 
+const flushSuppressedOccurrences = async (item: string): Promise<void> => {
+  const [projectId, fingerprint] = item.split(":");
+
+  const suppressedCount = await consumeSuppressedDuplicates(
+    redisWorker,
+    projectId,
+    fingerprint
+  );
+
+  if (suppressedCount === 0) {
+    return;
+  }
+
+  const result = await db.query(
+    `
+    SELECT
+      i.id,
+      i.service_id,
+      i.event_count,
+      i.severity,
+      e.environment,
+      e.level
+    FROM incidents i
+    JOIN services s
+      ON s.id = i.service_id
+    LEFT JOIN LATERAL (
+      SELECT environment, level
+      FROM events
+      WHERE incident_id = i.id
+      ORDER BY occurred_at DESC
+      LIMIT 1
+    ) e ON true
+    WHERE s.project_id = $1
+      AND i.fingerprint = $2
+      AND i.status IN ('open', 'acknowledged')
+    LIMIT 1
+    `,
+    [projectId, fingerprint]
+  );
+
+  if (result.rowCount === 0) {
+    console.log("No active incident found for suppressed flush:", fingerprint);
+    return;
+  }
+
+  const incident = result.rows[0];
+
+  const newEventCount = incident.event_count + suppressedCount;
+
+  const severityResult = calculateSeverity({
+    environment: incident.environment,
+    level: incident.level,
+    eventCount: newEventCount,
+
+    // Suppression happens only during a high-frequency burst.
+    isSpike: true,
+  });
+
+  const finalSeverity = getHigherSeverity(
+    incident.severity,
+    severityResult.severity
+  );
+
+  await db.query(
+    `
+    UPDATE incidents
+    SET
+      event_count = $1,
+      severity = $2,
+      severity_reasons = $3,
+      last_seen_at = NOW()
+    WHERE id = $4
+    `,
+    [
+      newEventCount,
+      finalSeverity,
+      JSON.stringify(severityResult.reasons),
+      incident.id,
+    ]
+  );
+
+  if (incident.severity !== finalSeverity) {
+    await db.query(
+      `
+      INSERT INTO incident_timeline (
+        incident_id,
+        type,
+        message
+      )
+      VALUES ($1, $2, $3)
+      `,
+      [
+        incident.id,
+        "severity_changed",
+        `Severity changed from ${incident.severity} to ${finalSeverity}`,
+      ]
+    );
+  }
+
+  await redisWorker.publish(
+    INCIDENT_UPDATE_CHANNEL,
+    JSON.stringify({
+      incidentId: incident.id,
+      serviceId: incident.service_id,
+      projectId,
+      type: "incident_updated",
+    })
+  );
+
+  console.log(
+    "Suppressed duplicates flushed:",
+    suppressedCount,
+    "incident:",
+    incident.id
+  );
+};
+
 const startWorker = async () => {
   await redisWorker.connect();
 
   console.log("Event worker connected to Redis");
 
   while (true) {
-    const result = await redisWorker.blPop(EVENT_QUEUE, 0);
+    const result = await redisWorker.blPop(EVENT_QUEUE, 1);
 
     if (!result) {
+      const dueFlushes = await getDueSuppressedFlushes(redisWorker);
+
+      for (const item of dueFlushes) {
+        await flushSuppressedOccurrences(item);
+      }
+
       continue;
     }
 
@@ -47,6 +174,16 @@ const startWorker = async () => {
     );
 
     console.log("Generated fingerprint:", fingerprint);
+
+    const suppressedDuplicates = await consumeSuppressedDuplicates(
+      redisWorker,
+      event.projectId,
+      fingerprint
+    );
+
+    const occurrenceCount = 1 + suppressedDuplicates;
+
+    console.log("Occurrences represented by this event:", occurrenceCount);
 
     // 2. Detect spike
     const spikeResult = await trackAndDetectSpike(redisWorker, fingerprint);
@@ -88,7 +225,7 @@ const startWorker = async () => {
 
       const previousSeverity = incident.severity;
 
-      const newEventCount = incident.event_count + 1;
+      const newEventCount = incident.event_count + occurrenceCount;
 
       const severityResult = calculateSeverity({
         environment: event.environment,
@@ -171,7 +308,7 @@ const startWorker = async () => {
       const severityResult = calculateSeverity({
         environment: event.environment,
         level: event.level,
-        eventCount: 1,
+        eventCount: occurrenceCount,
         isSpike,
       });
 
@@ -198,7 +335,7 @@ const startWorker = async () => {
           severityResult.severity,
           JSON.stringify(severityResult.reasons),
           "open",
-          1,
+          occurrenceCount,
           event.timestamp,
           event.timestamp,
         ]
