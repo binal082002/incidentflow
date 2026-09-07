@@ -230,6 +230,17 @@ Socket.IO connections are also JWT-authenticated. Users may join only realtime r
 
 ---
 
+### Ingest Protection & Rate Limiting
+
+To protect the API during error storms, IncidentFlow includes:
+
+- Project-level rate limiting using Redis.
+- Same-error suppression based on fingerprint, while preserving the real occurrence count.
+- Queue backpressure to stop new events when the Redis queue reaches its limit.
+- Request-size limits and `429` / `503` responses with retry hints.
+
+This reduces unnecessary processing during repeated error bursts while keeping incident counts and severity accurate.
+
 ## Project dashboard
 
 The dashboard shows:
