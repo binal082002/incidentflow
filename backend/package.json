@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "tsc && mkdir -p dist/database/migrations && cp src/database/migrations/*.sql dist/database/migrations/",
     "start": "node dist/server.js",
     "test": "jest",
     "migrate": "tsx src/database/migrate.ts",

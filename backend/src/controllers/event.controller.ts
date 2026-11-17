@@ -9,12 +9,17 @@ import {
   checkFingerprintRateLimit,
   recordSuppressedDuplicate,
 } from "../utils/fingerprintRateLimit";
+import { redis } from "../redis";
 
 export const ingestEvent = async (
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> => {
+  let idempotencyKey: string | undefined;
+  let keepIdempotencyKey = false;
+  let idempotencyKeyReserved = false;
+
   try {
     const apiKey = req.header("X-IncidentFlow-Key");
 
@@ -59,35 +64,43 @@ export const ingestEvent = async (
 
     const projectId = projectResult.rows[0].id;
 
-    const { service, environment, level, message, endpoint, timestamp } =
-      req.body as IncidentEvent;
+    const body = req.body;
 
-    if (!service || !environment || !level || !message || !timestamp) {
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
       res.status(400).json({
-        error:
-          "service, environment, level, message and timestamp are required",
+        error: "Request body must be a valid JSON object",
       });
       return;
     }
 
-    const fingerprint = generateFingerprint(service, endpoint, message);
+    const {
+      eventId,
+      service,
+      environment,
+      level,
+      message,
+      endpoint,
+      timestamp,
+    } = body as Partial<IncidentEvent>;
 
-    const fingerprintAllowed = await checkFingerprintRateLimit(
-      projectId,
-      fingerprint
-    );
-
-    if (!fingerprintAllowed) {
-      const suppressedCount = await recordSuppressedDuplicate(
-        projectId,
-        fingerprint
-      );
-
-      res.status(202).json({
-        message: "Duplicate event suppressed",
-        suppressedCount,
+    if (
+      typeof eventId !== "string" ||
+      !eventId.trim() ||
+      typeof service !== "string" ||
+      !service.trim() ||
+      typeof environment !== "string" ||
+      !["development", "staging", "production"].includes(environment) ||
+      typeof level !== "string" ||
+      !["INFO", "WARN", "ERROR", "FATAL"].includes(level) ||
+      typeof message !== "string" ||
+      !message.trim() ||
+      typeof timestamp !== "string" ||
+      !Number.isFinite(Date.parse(timestamp)) ||
+      (endpoint !== undefined && typeof endpoint !== "string")
+    ) {
+      res.status(400).json({
+        error: "Invalid event payload",
       });
-
       return;
     }
 
@@ -111,7 +124,47 @@ export const ingestEvent = async (
 
     const serviceId = serviceResult.rows[0].id;
 
+    idempotencyKey = `incidentflow:event:${serviceId}:${eventId}`;
+
+    const isNewEvent = await redis.set(idempotencyKey, "1", {
+      NX: true,
+      EX: 86400,
+    });
+
+    if (isNewEvent !== "OK") {
+      res.status(202).json({
+        message: "Event already received",
+      });
+      return;
+    }
+
+    idempotencyKeyReserved = true;
+
+    const fingerprint = generateFingerprint(service, endpoint, message);
+
+    const fingerprintAllowed = await checkFingerprintRateLimit(
+      projectId,
+      fingerprint
+    );
+
+    if (!fingerprintAllowed) {
+      const suppressedCount = await recordSuppressedDuplicate(
+        projectId,
+        fingerprint
+      );
+
+      keepIdempotencyKey = true;
+
+      res.status(202).json({
+        message: "Duplicate event suppressed",
+        suppressedCount,
+      });
+
+      return;
+    }
+
     const queued = await enqueueEvent({
+      eventId,
       service,
       serviceId,
       projectId,
@@ -133,10 +186,18 @@ export const ingestEvent = async (
       return;
     }
 
+    keepIdempotencyKey = true;
+
     res.status(202).json({
       message: "Event accepted for processing",
     });
   } catch (error) {
     next(error);
+  } finally {
+    if (idempotencyKeyReserved && !keepIdempotencyKey && idempotencyKey) {
+      await redis.del(idempotencyKey).catch((cleanupError) => {
+        console.error("Failed to release event idempotency key:", cleanupError);
+      });
+    }
   }
 };

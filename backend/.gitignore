@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 coverage/
+# Local development secrets
+.env.local

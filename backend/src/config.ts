@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 
-dotenv.config();
+dotenv.config({ path: process.env.APP_ENV === "local" ? ".env.local" : ".env" });
 
 const config = {
   port: Number(process.env.PORT) || 5000,

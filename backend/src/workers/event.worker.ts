@@ -166,42 +166,84 @@ const startWorker = async () => {
 
     console.log("Processing event:", event);
 
-    // 1. Generate fingerprint
-    const fingerprint = generateFingerprint(
-      event.service,
-      event.endpoint,
-      event.message
-    );
+    const client = await db.connect();
+    let incidentId: string;
 
-    console.log("Generated fingerprint:", fingerprint);
+    try {
+      await client.query("BEGIN");
 
-    const suppressedDuplicates = await consumeSuppressedDuplicates(
-      redisWorker,
-      event.projectId,
-      fingerprint
-    );
+      // 1. Prevent concurrent processing of the same event ID
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+        [event.serviceId, event.eventId]
+      );
 
-    const occurrenceCount = 1 + suppressedDuplicates;
+      // 2. Check whether this event was already processed
+      const existingEvent = await client.query(
+        `
+        SELECT id
+        FROM events
+        WHERE service_id = $1
+          AND event_id = $2
+        LIMIT 1
+        `,
+        [event.serviceId, event.eventId]
+      );
 
-    console.log("Occurrences represented by this event:", occurrenceCount);
+      if (existingEvent.rows.length > 0) {
+        console.log("Duplicate event ignored:", event.eventId);
+        await client.query("COMMIT");
+        continue;
+      }
 
-    // 2. Detect spike
-    const spikeResult = await trackAndDetectSpike(redisWorker, fingerprint);
+      // 3. Generate fingerprint
+      const fingerprint = generateFingerprint(
+        event.service,
+        event.endpoint,
+        event.message
+      );
 
-    const { isSpike, spikeStarted, count: spikeCount } = spikeResult;
+      console.log("Generated fingerprint:", fingerprint);
 
-    console.log(
-      "Spike:",
-      isSpike,
-      "started:",
-      spikeStarted,
-      "count:",
-      spikeCount
-    );
+      // 4. Consume suppressed duplicates
+      const suppressedDuplicates = await consumeSuppressedDuplicates(
+        redisWorker,
+        event.projectId,
+        fingerprint
+      );
 
-    // 3. Find an active incident with the same fingerprint
-    const existingIncident = await db.query(
-      `
+      const occurrenceCount = 1 + suppressedDuplicates;
+
+      console.log("Occurrences represented by this event:", occurrenceCount);
+
+      // 5. Detect spike
+      const spikeResult = await trackAndDetectSpike(
+        redisWorker,
+        event.projectId,
+        fingerprint
+      );
+
+      const { isSpike, spikeStarted, count: spikeCount } = spikeResult;
+
+      console.log(
+        "Spike:",
+        isSpike,
+        "started:",
+        spikeStarted,
+        "count:",
+        spikeCount
+      );
+
+      // 6. Lock this service + fingerprint before checking its incident
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))`,
+        [event.serviceId, fingerprint]
+      );
+
+      // Find an active incident with the same fingerprint
+
+      const existingIncident = await client.query(
+        `
       SELECT *
       FROM incidents
       WHERE service_id = $1
@@ -209,38 +251,36 @@ const startWorker = async () => {
         AND status IN ('open', 'acknowledged')
       LIMIT 1
       `,
-      [event.serviceId, fingerprint]
-    );
-
-    let incidentId: string;
-
-    if (existingIncident.rowCount && existingIncident.rowCount > 0) {
-      // -----------------------------------
-      // Existing incident
-      // -----------------------------------
-
-      const incident = existingIncident.rows[0];
-
-      incidentId = incident.id;
-
-      const previousSeverity = incident.severity;
-
-      const newEventCount = incident.event_count + occurrenceCount;
-
-      const severityResult = calculateSeverity({
-        environment: event.environment,
-        level: event.level,
-        eventCount: newEventCount,
-        isSpike,
-      });
-
-      const finalSeverity = getHigherSeverity(
-        previousSeverity,
-        severityResult.severity
+        [event.serviceId, fingerprint]
       );
 
-      await db.query(
-        `
+      if (existingIncident.rowCount && existingIncident.rowCount > 0) {
+        // -----------------------------------
+        // Existing incident
+        // -----------------------------------
+
+        const incident = existingIncident.rows[0];
+
+        incidentId = incident.id;
+
+        const previousSeverity = incident.severity;
+
+        const newEventCount = incident.event_count + occurrenceCount;
+
+        const severityResult = calculateSeverity({
+          environment: event.environment,
+          level: event.level,
+          eventCount: newEventCount,
+          isSpike,
+        });
+
+        const finalSeverity = getHigherSeverity(
+          previousSeverity,
+          severityResult.severity
+        );
+
+        await client.query(
+          `
         UPDATE incidents
         SET
             event_count = $1,
@@ -249,38 +289,19 @@ const startWorker = async () => {
             last_seen_at = $4
         WHERE id = $5
         `,
-        [
-          newEventCount,
-          finalSeverity,
-          JSON.stringify(severityResult.reasons),
-          event.timestamp,
-          incidentId,
-        ]
-      );
-
-      // Timeline: severity changed
-      if (previousSeverity !== finalSeverity) {
-        await db.query(
-          `
-          INSERT INTO incident_timeline (
-            incident_id,
-            type,
-            message
-          )
-          VALUES ($1, $2, $3)
-          `,
           [
+            newEventCount,
+            finalSeverity,
+            JSON.stringify(severityResult.reasons),
+            event.timestamp,
             incidentId,
-            "severity_changed",
-            `Severity changed from ${previousSeverity} to ${finalSeverity}`,
           ]
         );
-      }
 
-      // Timeline: spike detected
-      if (spikeStarted) {
-        await db.query(
-          `
+        // Timeline: severity changed
+        if (previousSeverity !== finalSeverity) {
+          await client.query(
+            `
           INSERT INTO incident_timeline (
             incident_id,
             type,
@@ -288,32 +309,51 @@ const startWorker = async () => {
           )
           VALUES ($1, $2, $3)
           `,
-          [incidentId, "spike_detected", "Error spike detected"]
+            [
+              incidentId,
+              "severity_changed",
+              `Severity changed from ${previousSeverity} to ${finalSeverity}`,
+            ]
+          );
+        }
+
+        // Timeline: spike detected
+        if (spikeStarted) {
+          await client.query(
+            `
+          INSERT INTO incident_timeline (
+            incident_id,
+            type,
+            message
+          )
+          VALUES ($1, $2, $3)
+          `,
+            [incidentId, "spike_detected", "Error spike detected"]
+          );
+        }
+
+        console.log(
+          "Existing incident updated:",
+          incidentId,
+          "severity:",
+          finalSeverity,
+          "reasons:",
+          severityResult.reasons
         );
-      }
+      } else {
+        // -----------------------------------
+        // New incident
+        // -----------------------------------
 
-      console.log(
-        "Existing incident updated:",
-        incidentId,
-        "severity:",
-        finalSeverity,
-        "reasons:",
-        severityResult.reasons
-      );
-    } else {
-      // -----------------------------------
-      // New incident
-      // -----------------------------------
+        const severityResult = calculateSeverity({
+          environment: event.environment,
+          level: event.level,
+          eventCount: occurrenceCount,
+          isSpike,
+        });
 
-      const severityResult = calculateSeverity({
-        environment: event.environment,
-        level: event.level,
-        eventCount: occurrenceCount,
-        isSpike,
-      });
-
-      const newIncident = await db.query(
-        `
+        const newIncident = await client.query(
+          `
         INSERT INTO incidents (
           service_id,
           title,
@@ -328,24 +368,24 @@ const startWorker = async () => {
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *
         `,
-        [
-          event.serviceId,
-          event.message,
-          fingerprint,
-          severityResult.severity,
-          JSON.stringify(severityResult.reasons),
-          "open",
-          occurrenceCount,
-          event.timestamp,
-          event.timestamp,
-        ]
-      );
+          [
+            event.serviceId,
+            event.message,
+            fingerprint,
+            severityResult.severity,
+            JSON.stringify(severityResult.reasons),
+            "open",
+            occurrenceCount,
+            event.timestamp,
+            event.timestamp,
+          ]
+        );
 
-      incidentId = newIncident.rows[0].id;
+        incidentId = newIncident.rows[0].id;
 
-      // Timeline: incident created
-      await db.query(
-        `
+        // Timeline: incident created
+        await client.query(
+          `
         INSERT INTO incident_timeline (
           incident_id,
           type,
@@ -353,12 +393,12 @@ const startWorker = async () => {
         )
         VALUES ($1, $2, $3)
         `,
-        [incidentId, "created", "Incident created"]
-      );
+          [incidentId, "created", "Incident created"]
+        );
 
-      if (spikeStarted) {
-        await db.query(
-          `
+        if (spikeStarted) {
+          await client.query(
+            `
           INSERT INTO incident_timeline (
             incident_id,
             type,
@@ -366,48 +406,60 @@ const startWorker = async () => {
           )
           VALUES ($1, $2, $3)
           `,
-          [incidentId, "spike_detected", "Error spike detected"]
+            [incidentId, "spike_detected", "Error spike detected"]
+          );
+        }
+
+        console.log(
+          "New incident created:",
+          incidentId,
+          "severity:",
+          severityResult.severity,
+          "reasons:",
+          severityResult.reasons
         );
       }
 
-      console.log(
-        "New incident created:",
-        incidentId,
-        "severity:",
-        severityResult.severity,
-        "reasons:",
-        severityResult.reasons
+      // 4. Save the actual event
+      await client.query(
+        `
+          INSERT INTO events (
+            service_id,
+            event_id,
+            incident_id,
+            environment,
+            level,
+            message,
+            endpoint,
+            fingerprint,
+            occurred_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `,
+        [
+          event.serviceId,
+          event.eventId,
+          incidentId,
+          event.environment,
+          event.level,
+          event.message,
+          event.endpoint ?? null,
+          fingerprint,
+          event.timestamp,
+        ]
       );
+
+      console.log("Event saved to PostgreSQL");
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch((rollbackError) => {
+        console.error("Failed to roll back event transaction:", rollbackError);
+      });
+      throw error;
+    } finally {
+      client.release();
     }
-
-    // 4. Save the actual event
-    await db.query(
-      `
-      INSERT INTO events (
-        service_id,
-        incident_id,
-        environment,
-        level,
-        message,
-        endpoint,
-        fingerprint,
-        occurred_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      `,
-      [
-        event.serviceId,
-        incidentId,
-        event.environment,
-        event.level,
-        event.message,
-        event.endpoint ?? null,
-        fingerprint,
-        event.timestamp,
-      ]
-    );
-
-    console.log("Event saved to PostgreSQL");
 
     await redisWorker.publish(
       INCIDENT_UPDATE_CHANNEL,

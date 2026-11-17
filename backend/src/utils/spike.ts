@@ -10,9 +10,10 @@ interface SpikeResult {
 
 export const trackAndDetectSpike = async (
   redisClient: RedisClientType,
+  projectId: string,
   fingerprint: string
 ): Promise<SpikeResult> => {
-  const key = `spike:${fingerprint}`;
+  const key = `spike:${projectId}:${fingerprint}`;
 
   const count = await redisClient.incr(key);
 
