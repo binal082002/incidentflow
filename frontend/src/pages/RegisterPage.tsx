@@ -23,7 +23,7 @@ function RegisterPage() {
 
       saveAuth(result.token, result.user);
 
-      navigate("/");
+      navigate("/projects");
     } catch (error) {
       setError(error instanceof Error ? error.message : "Failed to register");
     } finally {

@@ -1,6 +1,8 @@
+
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import ProtectedRoute from "./components/ProtectedRoute";
 
+import LandingPage from "./pages/LandingPage";
 import ProjectsPage from "./pages/ProjectsPage";
 import DashboardPage from "./pages/DashboardPage";
 import IncidentDetailPage from "./pages/IncidentDetailPage";
@@ -12,11 +14,14 @@ function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Public routes */}
+        <Route path="/" element={<LandingPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
 
+        {/* Protected routes */}
         <Route
-          path="/"
+          path="/projects"
           element={
             <ProtectedRoute>
               <ProjectsPage />
